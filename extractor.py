@@ -13,10 +13,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
+import json
+import os
+from pathlib import Path
 import re
+import time
 
 import dateparser
 import spacy
+import streamlit as st
+from dateparser.search import search_dates
+from google import genai
 
 
 # Candidate action verbs/phrases for MVP task detection.
@@ -85,6 +92,46 @@ def _load_nlp():
 NLP = _load_nlp()
 
 
+def _get_gemini_api_key() -> str:
+    """
+    Resolve Gemini API key from Streamlit secrets first, then env/file fallbacks.
+    """
+    # Primary path for Streamlit apps.
+    try:
+        secret_value = st.secrets.get("GEMINI_API_KEY")
+        if isinstance(secret_value, str) and secret_value.strip():
+            return secret_value.strip()
+    except Exception:
+        pass
+
+    # Fallback for local/script usage.
+    env_key = os.getenv("GEMINI_API_KEY")
+    if env_key and env_key.strip():
+        return env_key.strip()
+
+    # Optional local fallback to project secrets file.
+    candidate_paths = [
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+    ]
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            left, right = line.split("=", 1)
+            if left.strip() != "GEMINI_API_KEY":
+                continue
+            value = right.strip().strip("\"' ")
+            if value:
+                return value
+
+    raise KeyError(
+        "GEMINI_API_KEY not found. Set it in Streamlit secrets, env var, or .streamlit/secrets.toml."
+    )
+
+
 def _contains_action_phrase(text: str) -> bool:
     lowered = text.lower()
     return any(phrase in lowered for phrase in ACTION_PHRASES)
@@ -148,7 +195,7 @@ def _extract_due_date(text: str) -> Optional[str]:
         due = phrase_match.group(0).strip()
         return _normalize_due_display(due)
 
-    parsed = dateparser.search.search_dates(text, languages=["en"])
+    parsed = search_dates(text, languages=["en"])
     if parsed:
         return _normalize_due_display(parsed[0][0].strip())
 
@@ -270,3 +317,155 @@ def extract_action_items(email_text: str) -> List[Dict[str, object]]:
             items.append(item)
 
     return [item.to_dict() for item in items]
+
+
+def _build_gemini_prompt(email_text: str) -> str:
+    """Create a strict prompt that asks Gemini for JSON-only task extraction."""
+    return f"""
+You are an information extraction assistant.
+Extract all action items from the email below.
+
+Rules:
+1) Split multiple tasks into separate objects.
+2) Extract due dates or deadline phrases when present.
+3) Extract names of people mentioned in each task.
+4) Set priority to "High" if urgency words are present (e.g., ASAP, urgent, immediately, priority, important); otherwise "Normal".
+5) Return valid JSON only.
+6) Do not return markdown.
+7) Do not return explanation text.
+8) Output must be a JSON array and every object must include exactly these keys:
+   - task (string)
+   - due_date (string or null)
+   - people (array of strings)
+   - priority (string: "High" or "Normal")
+   - source_sentence (string)
+
+Expected JSON schema example:
+[
+  {{
+    "task": "Send the slides",
+    "due_date": "Friday",
+    "people": ["Marcus"],
+    "priority": "Normal",
+    "source_sentence": "Can you send the slides to Marcus by Friday?"
+  }}
+]
+
+Email:
+\"\"\"
+{email_text}
+\"\"\"
+""".strip()
+
+
+def _normalize_gemini_items(raw_items: object) -> List[Dict[str, object]]:
+    """
+    Normalize Gemini output to match app schema exactly.
+    """
+    if not isinstance(raw_items, list):
+        raise ValueError("Gemini output must be a JSON array.")
+
+    normalized: List[Dict[str, object]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        task = str(item.get("task", "")).strip()
+        due_date = item.get("due_date", None)
+        people = item.get("people", [])
+        priority = str(item.get("priority", "Normal")).strip() or "Normal"
+        source_sentence = str(item.get("source_sentence", "")).strip()
+
+        if not task:
+            continue
+        if due_date is not None:
+            due_date = str(due_date).strip() or None
+        if not isinstance(people, list):
+            people = []
+        people = [str(p).strip() for p in people if str(p).strip()]
+        if priority not in {"High", "Normal"}:
+            priority = "High" if priority.lower() == "high" else "Normal"
+        if not source_sentence:
+            source_sentence = task
+
+        normalized.append(
+            {
+                "task": task,
+                "due_date": due_date,
+                "people": people,
+                "priority": priority,
+                "source_sentence": source_sentence,
+            }
+        )
+
+    return normalized
+
+
+def _parse_gemini_json(response_text: str) -> object:
+    """
+    Parse Gemini output as JSON with light cleanup for common wrappers.
+    """
+    text = response_text.strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response.")
+
+    # 1) Best case: already strict JSON.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Common case: fenced markdown around JSON.
+    fenced_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        fenced_payload = fenced_match.group(1).strip()
+        try:
+            return json.loads(fenced_payload)
+        except json.JSONDecodeError:
+            pass
+
+    # 3) Last attempt: first JSON-like array/object inside response.
+    for pattern in (r"(\[.*\])", r"(\{.*\})"):
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        payload = match.group(1).strip()
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Could not parse valid JSON from Gemini response.")
+
+
+def extract_action_items_gemini(email_text: str) -> List[Dict[str, object]]:
+    """
+    Extract action items with Gemini and return the same schema as rule-based extraction.
+    """
+    if not email_text or not email_text.strip():
+        return []
+
+    client = genai.Client(api_key=_get_gemini_api_key())
+    prompt = _build_gemini_prompt(email_text)
+
+    # Retry a few times for transient availability issues, then try a fallback model.
+    last_error: Optional[Exception] = None
+    candidate_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    for model_name in candidate_models:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+                response_text = (response.text or "").strip()
+                parsed = _parse_gemini_json(response_text)
+                return _normalize_gemini_items(parsed)
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+
+    raise RuntimeError(f"Gemini extraction failed after retries: {last_error}")
