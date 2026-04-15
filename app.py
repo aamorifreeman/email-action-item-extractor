@@ -1,12 +1,17 @@
 import streamlit as st
 
-from extractor import extract_action_items
+from extractor import extract_action_items, extract_action_items_gemini
 
 
 st.set_page_config(page_title="Email Action Item Extractor", page_icon="📧", layout="wide")
 
 st.title("Email Action Item Extractor")
 st.caption("Paste a long email and extract tasks, due dates, people, and urgency hints.")
+
+mode = st.radio(
+    "Extraction Mode",
+    ["Rule-Based NLP", "Gemini AI Extraction"]
+)
 
 default_text = (
     "Can you send the slides by Friday, follow up with Jasmine next week, "
@@ -23,7 +28,15 @@ email_text = st.text_area(
 extract_clicked = st.button("Extract Tasks", type="primary")
 
 if extract_clicked:
-    results = extract_action_items(email_text)
+    if mode == "Rule-Based NLP":
+        results = extract_action_items(email_text)
+    else:
+        try:
+            results = extract_action_items_gemini(email_text)
+        except Exception as exc:
+            st.warning("AI extraction failed, falling back to rule-based NLP.")
+            st.caption(f"Gemini error: {exc}")
+            results = extract_action_items(email_text)
 
     if not results:
         st.warning("No obvious action items found. Try adding clearer task verbs.")
