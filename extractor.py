@@ -19,7 +19,6 @@ from pathlib import Path
 import re
 import time
 
-import dateparser
 import spacy
 import streamlit as st
 from dateparser.search import search_dates

@@ -4,4 +4,3 @@ __pycache__/
 .venv/
 venv/
 .streamlit/secrets.toml
-test_gemini.py
