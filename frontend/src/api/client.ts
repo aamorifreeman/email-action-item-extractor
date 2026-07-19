@@ -1,5 +1,6 @@
-// Typed fetch wrapper around the InboxIQ API. Uses relative /api URLs; the
-// Vite dev server proxies them to the FastAPI backend.
+// Typed fetch wrapper around the InboxIQ API. Defaults to relative /api (the
+// Vite dev server proxies it to FastAPI); set VITE_API_BASE for a deployed
+// backend on a different origin.
 
 import type {
   BulkSaveResponse,
@@ -10,8 +11,10 @@ import type {
   TaskItem,
 } from "../types";
 
+const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -53,7 +56,7 @@ export const api = {
   },
 
   deleteTask(id: string) {
-    return fetch(`/api/tasks/${id}`, { method: "DELETE" });
+    return fetch(`${API_BASE}/tasks/${id}`, { method: "DELETE" });
   },
 
   async calendarLinks(tasks: TaskItem[]) {
@@ -63,5 +66,5 @@ export const api = {
     );
   },
 
-  csvUrl: "/api/tasks/export.csv",
+  csvUrl: `${API_BASE}/tasks/export.csv`,
 };
