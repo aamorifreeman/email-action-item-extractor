@@ -15,8 +15,13 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create database tables."""
+    """Startup: create tables and warm ML singletons so the first request is fast."""
     init_db()
+    from app.ml.embeddings import get_embedder
+    from app.ml.rule_based import get_nlp
+
+    get_nlp()
+    get_embedder()
     yield
 
 
@@ -39,3 +44,11 @@ app.add_middleware(
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# Routers (implemented under app/api/).
+from app.api import extraction, integrations, tasks  # noqa: E402
+
+app.include_router(extraction.router, prefix="/api", tags=["extraction"])
+app.include_router(tasks.router, prefix="/api", tags=["tasks"])
+app.include_router(integrations.router, prefix="/api", tags=["integrations"])
